@@ -65,7 +65,12 @@ ESA 背后的核心思想是一个依赖于层的插值因子 `α`，其定义�
 
 在不同层和不同头之间，可以清晰地观察到这些状态之间的平滑插值。
 
-![此处应为可视化图表的占位符，展示模式从局部到扩展的变化]
+<p align="center">
+  <img src="./figs/layer_0_seq_512_heads_8_k_32.png" alt="Layer 0" width="200"/>
+  <img src="./figs/layer_6_seq_512_heads_8_k_32.png" alt="Layer 6" width="200"/>
+  <img src="./figs/layer_11_seq_512_heads_8_k_32.png" alt="Layer 11" width="200"/>
+</p>
+
 
 #### 4.2. 感受野分析
 稀疏注意力机制的一个关键失效模式是存在“注意力空洞”，即一个查询位置即使经过多层注意力，也无法与某些先前的特定位置建立信息通路。
