@@ -571,7 +571,7 @@ class ElasticSparseAttention(nn.Module):
         # 返回时增加一个批次维度，以匹配 SDPA 的期望格式。
         return full_mask.unsqueeze(0)
 
-    def _get_prepared_indices_and_mask(self, q_seq_len: int, kv_seq_len: int):
+    def _get_prepared_indices_and_mask(self, kv_seq_len: int):
         """
         Slices the required indices and mask for the current sequence length from the pre-computed cache.
         从预计算的缓存中切片出当前序列长度所需的索引和掩码。
@@ -585,8 +585,8 @@ class ElasticSparseAttention(nn.Module):
         
         # Slice the pre-computed tensors.
         # 切片预计算的张量。
-        indices = self.sparse_attention_indices[:, :q_seq_len, :]
-        mask = self.sparse_causal_mask[:, :q_seq_len, :]
+        indices = self.sparse_attention_indices[:, :kv_seq_len, :]
+        mask = self.sparse_causal_mask[:, :kv_seq_len, :]
         return indices, mask
 
     def _triton_forward(self, query_states, key_states, value_states, cache_position):
@@ -597,7 +597,7 @@ class ElasticSparseAttention(nn.Module):
         
         # Get indices and mask from cache instead of dynamic generation.
         # 从缓存中获取索引和掩码，而不是动态生成。
-        attention_indices, attention_mask = self._get_prepared_indices_and_mask(q_seq_len, kv_seq_len)
+        attention_indices, attention_mask = self._get_prepared_indices_and_mask(kv_seq_len)
 
         if cache_position is not None:
             # For decoding, we only need the indices and mask for the current position.
