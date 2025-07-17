@@ -1,8 +1,7 @@
-import math
 from typing import Optional, Tuple
 
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
 
 # Try importing necessary utilities from transformers, with a fallback to standard libraries.
@@ -76,6 +75,8 @@ if is_triton_available():
         ATTN_LENGTH: tl.constexpr,
         BLOCK_A: tl.constexpr,
         IS_BWD: tl.constexpr,
+        # --- GQA Support ---
+        NUM_KV_GROUPS: tl.constexpr,
     ):
         # Each program instance computes the attention for one query token in one head.
         # 每个程序实例计算一个头中一个查询 token 的注意力。
@@ -83,13 +84,19 @@ if is_triton_available():
         head_idx = tl.program_id(1)   # Head index / 注意力头的索引
         batch_idx = tl.program_id(2)  # Batch index / 批次的索引
 
+        # GQA: Map query head index to its corresponding key/value head index.
+        # GQA: 将查询头索引映射到其对应的键/值头索引。
+        kv_head_idx = head_idx // NUM_KV_GROUPS
+
         # Pointers to the current query, key, value, indices, and mask.
         # 指向当前 query, key, value, indices, 和 mask 的指针。
         q_offset = batch_idx * stride_q_b + head_idx * stride_q_h + q_pos * stride_q_s
         offs_d = tl.arange(0, HEAD_DIM)
         
-        k_base_ptr = K + batch_idx * stride_k_b + head_idx * stride_k_h
-        v_base_ptr = V + batch_idx * stride_v_b + head_idx * stride_v_h
+        # GQA: Use kv_head_idx for K and V pointers.
+        # GQA: 对 K 和 V 指针使用 kv_head_idx。
+        k_base_ptr = K + batch_idx * stride_k_b + kv_head_idx * stride_k_h
+        v_base_ptr = V + batch_idx * stride_v_b + kv_head_idx * stride_v_h
         
         indices_base_ptr = sparse_indices + head_idx * stride_idx_h + q_pos * stride_idx_s
         mask_base_ptr = sparse_mask + head_idx * stride_mask_h + q_pos * stride_mask_s
@@ -160,6 +167,11 @@ if is_triton_available():
 
         # --- Backward Pass ---
         if IS_BWD:
+            # GQA: Use kv_head_idx for dK and dV pointers.
+            # GQA: 对 dK 和 dV 指针使用 kv_head_idx。
+            dk_base_ptr = dK + batch_idx * stride_dk_b + kv_head_idx * stride_dk_h
+            dv_base_ptr = dV + batch_idx * stride_dv_b + kv_head_idx * stride_dv_h
+
             # Load do, l, m, and o from the forward pass.
             # 从前向传播加载 do, l, m, 和 o。
             do_ptr = dO + batch_idx * stride_do_b + head_idx * stride_do_h + q_pos * stride_do_s
@@ -198,7 +210,7 @@ if is_triton_available():
                 # 计算 dV：dV = P^T * dO
                 dv = p[:, None] * do[None, :]
                 dv_offs = k_indices[:, None] * stride_dv_s + offs_d[None, :]
-                tl.atomic_add(dV + batch_idx * stride_dv_b + head_idx * stride_dv_h + dv_offs, dv, mask=k_gather_mask)
+                tl.atomic_add(dv_base_ptr + dv_offs, dv, mask=k_gather_mask)
                 
                 # Compute dS = P * (dO^T * V - sum(dO * O))
                 # 计算 dS = P * (dO^T * V - sum(dO * O))
@@ -213,20 +225,20 @@ if is_triton_available():
                 # 计算 dK: dK = dS^T * Q
                 dk = ds[:, None] * q[None, :]
                 dk_offs = k_indices[:, None] * stride_dk_s + offs_d[None, :]
-                tl.atomic_add(dK + batch_idx * stride_dk_b + head_idx * stride_dk_h + dk_offs, dk, mask=k_gather_mask)
+                tl.atomic_add(dk_base_ptr + dk_offs, dk, mask=k_gather_mask)
 
             # Store the final dQ gradient.
             # 存储最终的 dQ 梯度。
             dq_ptr = dQ + batch_idx*stride_dq_b + head_idx*stride_dq_h + q_pos*stride_dq_s
             tl.store(dq_ptr + offs_d, dq_acc.to(dQ.dtype.element_ty))
-    
+
     class ElasticSparseAttentionFunction(torch.autograd.Function):
         """
         A custom autograd function to wrap the Triton kernel for elastic sparse attention.
         一个自定义的 autograd 函数，用于封装弹性稀疏注意力的 Triton 内核。
         """
         @staticmethod
-        def forward(ctx, q, k, v, sparse_indices, sparse_mask, sm_scale):
+        def forward(ctx, q, k, v, sparse_indices, sparse_mask, sm_scale, num_kv_groups):
             # Ensure tensors are contiguous for kernel performance.
             # 确保张量是连续的，以保证内核性能。
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
@@ -272,6 +284,7 @@ if is_triton_available():
                 # Pass metadata and compile-time constants.
                 # 传递元数据和编译时常量。
                 kv_seq_len=kv_seq_len, HEAD_DIM=head_dim, ATTN_LENGTH=attn_length, IS_BWD=False,
+                NUM_KV_GROUPS=num_kv_groups,
             )
             
             # Save tensors for the backward pass.
@@ -280,6 +293,7 @@ if is_triton_available():
             ctx.sm_scale = sm_scale
             ctx.head_dim = head_dim
             ctx.attn_length = attn_length
+            ctx.num_kv_groups = num_kv_groups
             return o
 
         @staticmethod
@@ -318,10 +332,11 @@ if is_triton_available():
                 stride_dk_b=dk.stride(0), stride_dk_h=dk.stride(1), stride_dk_s=dk.stride(2),
                 stride_dv_b=dv.stride(0), stride_dv_h=dv.stride(1), stride_dv_s=dv.stride(2),
                 kv_seq_len=k.shape[2], HEAD_DIM=ctx.head_dim, ATTN_LENGTH=ctx.attn_length, IS_BWD=True,
+                NUM_KV_GROUPS=ctx.num_kv_groups,
             )
             # Return gradients for q, k, v. Other inputs don't require gradients.
             # 返回 q, k, v 的梯度。其他输入不需要梯度。
-            return dq, dk, dv, None, None, None
+            return dq, dk, dv, None, None, None, None
 
 # ==============================================================================
 #            END: OPTIMIZED & UNIFIED Triton Kernel Implementation
@@ -329,8 +344,8 @@ if is_triton_available():
 
 class ElasticSparseAttention(nn.Module):
     """
-    A standalone Elastic Sparse Attention module.
-    一个独立的弹性稀疏注意力（Elastic Sparse Attention）模块。
+    A standalone Elastic Sparse Attention module, with support for Grouped-Query Attention (GQA).
+    一个独立的弹性稀疏注意力（Elastic Sparse Attention）模块，支持分组查询注意力（GQA）。
 
     This module is abstracted from a full attention mechanism, focusing on the core
     computation of elastic sparse attention. It does not include any linear projection layers,
@@ -365,6 +380,7 @@ class ElasticSparseAttention(nn.Module):
         head_dim: int,
         attention_length: int,
         max_seq_len: int,
+        num_key_value_heads: Optional[int] = None,
         attention_dropout: float = 0.0,
         implementation: str = "triton",
     ):
@@ -375,10 +391,15 @@ class ElasticSparseAttention(nn.Module):
         Args:
             layer_idx (`int`): The index of the current layer (starting from 0). // 当前层的索引 (从 0 开始)。
             num_hidden_layers (`int`): The total number of layers in the model. // 模型中的总层数。
-            num_attention_heads (`int`): The number of attention heads. // 注意力头的数量。
+            num_attention_heads (`int`): The number of attention heads for queries (Q). // 查询（Q）的注意力头数量。
             head_dim (`int`): The dimension of each attention head. // 每个注意力头的维度。
             attention_length (`int`): The window length of the sparse attention pattern (w). // 稀疏注意力模式的窗口长度 (w)。
             max_seq_len (`int`): The maximum sequence length supported by the model, used for pre-computing and caching indices/masks. // 模型支持的最大序列长度，用于预计算和缓存索引/掩码。
+            num_key_value_heads (`Optional[int]`, *optional*):
+                The number of attention heads for keys and values (K, V). If not provided, defaults to `num_attention_heads` (MHA).
+                For GQA, `num_attention_heads` must be divisible by `num_key_value_heads`.
+                键（K）和值（V）的注意力头数量。如果未提供，则默认为 `num_attention_heads`（MHA）。
+                对于 GQA，`num_attention_heads` 必须能被 `num_key_value_heads` 整除。
             attention_dropout (`float`, *optional*, defaults to 0.0):
                 The dropout probability applied to the attention weights. // 应用于注意力权重的 dropout 概率。
             implementation (`str`, *optional*, defaults to "triton"):
@@ -410,6 +431,16 @@ class ElasticSparseAttention(nn.Module):
         self.implementation = implementation
         self.max_seq_len = max_seq_len
         
+        self.num_key_value_heads = num_key_value_heads if num_key_value_heads is not None else num_attention_heads
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"`num_attention_heads` ({self.num_attention_heads}) must be divisible by "
+                f"`num_key_value_heads` ({self.num_key_value_heads}) for GQA."
+                f" // 对于 GQA, `num_attention_heads` ({self.num_attention_heads}) 必须能被 "
+                f"`num_key_value_heads` ({self.num_key_value_heads}) 整除。"
+            )
+        self.num_kv_groups = self.num_attention_heads // self.num_key_value_heads
+        
         self.scaling = self.head_dim**-0.5
 
         # --- Pre-caching indices and masks ---
@@ -439,7 +470,9 @@ class ElasticSparseAttention(nn.Module):
     def _create_elastic_sparse_indices(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Computes and returns the indices and mask for elastic sparse attention.
+        The pattern is generated per query head.
         计算并返回弹性稀疏注意力的索引和掩码。
+        稀疏模式是为每个查询头生成的。
         """
         attn_length = self.attention_length
         num_hidden_layers = self.num_hidden_layers
@@ -504,7 +537,9 @@ class ElasticSparseAttention(nn.Module):
     def _create_full_sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
         Calls the sparse index generation logic and converts it into a full-sized boolean attention mask.
+        The mask is created with `num_attention_heads` as SDPA expects a mask matching the query heads for GQA.
         调用稀疏索引生成逻辑，并将其转换为一个全尺寸的布尔注意力掩码。
+        掩码的头数量与 `num_attention_heads` 匹配，因为 SDPA 在 GQA 模式下期望掩码与查询头对齐。
         """
         original_indices, causal_mask_for_indices = self._create_elastic_sparse_indices(seq_len, device)
         
@@ -517,13 +552,20 @@ class ElasticSparseAttention(nn.Module):
         h_indices = torch.arange(self.num_attention_heads, device=device).view(-1, 1, 1).expand_as(original_indices)
         q_indices = torch.arange(seq_len, device=device).view(1, -1, 1).expand_as(original_indices)
         k_indices = original_indices.clamp(min=0, max=seq_len - 1)
-
-        full_mask[h_indices, q_indices, k_indices] = True
         
-        # Ensure causality: set non-causal positions to False.
-        # 确保因果性：将不满足因果条件的位置设为 False。
-        is_causal = causal_mask_for_indices.bool()
-        full_mask = full_mask & is_causal.unsqueeze(-1)
+        # The causal_mask_for_indices tells us which of the sparse connections are valid.
+        # causal_mask_for_indices 告诉我们哪些稀疏连接是有效的。
+        is_causal_mask = causal_mask_for_indices.bool()
+
+        # Use the causal mask to select only the valid indices before assigning them.
+        # This avoids populating the full_mask with non-causal locations in the first place.
+        # 使用因果掩码在赋值前只选择有效的索引。
+        # 这从一开始就避免了用非因果位置填充 full_mask。
+        h_indices_valid = h_indices[is_causal_mask]
+        q_indices_valid = q_indices[is_causal_mask]
+        k_indices_valid = k_indices[is_causal_mask]
+
+        full_mask[h_indices_valid, q_indices_valid, k_indices_valid] = True
         
         # Return with a batch dimension to match SDPA's expected format.
         # 返回时增加一个批次维度，以匹配 SDPA 的期望格式。
@@ -559,18 +601,21 @@ class ElasticSparseAttention(nn.Module):
 
         if cache_position is not None:
             # For decoding, we only need the indices and mask for the current position.
-            # The slicing here is correct because cache_position corresponds to the q_seq_len dimension.
             # 对于解码，我们只需要当前位置的索引和掩码。
-            # 这里的切片是在已经切片到 q_seq_len 之后进行的，这是正确的，因为 cache_position 对应于 q_seq_len 维度。
-            attention_indices = torch.gather(attention_indices, 1, cache_position.view(1, -1, 1).expand(-1, -1, attention_indices.shape[-1]))
-            attention_mask = torch.gather(attention_mask, 1, cache_position.view(1, -1, 1).expand(-1, -1, attention_mask.shape[-1]))
+            # For decoding, we only need the indices and mask for the current position.
+            # The slicing here is correct because cache_position corresponds to the q_seq_len dimension.
+            attention_indices = attention_indices[:, cache_position, :]
+            attention_mask = attention_mask[:, cache_position, :]
+        else:
+            attention_indices = attention_indices[:, :q_seq_len]
+            attention_mask = attention_mask[:, :q_seq_len]
 
         # Clamp indices to prevent out-of-bounds access in case of kv_cache length mismatch.
         # 防止 kv cache 长度和索引不匹配的边缘情况，对索引进行钳位。
         attention_indices = torch.clamp(attention_indices, min=0, max=kv_seq_len - 1)
         
         attn_output = ElasticSparseAttentionFunction.apply(
-            query_states, key_states, value_states, attention_indices, attention_mask, self.scaling
+            query_states, key_states, value_states, attention_indices, attention_mask, self.scaling, self.num_kv_groups
         )
         # The Triton kernel does not return attention weights to save computation and memory.
         # Triton 内核不返回注意力权重以节省计算和内存。
@@ -582,18 +627,28 @@ class ElasticSparseAttention(nn.Module):
         batch_size, num_heads, q_seq_len, head_dim = query_states.shape
         kv_seq_len = key_states.shape[2]
         
+        # GQA: Repeat K and V heads to match Q heads
+        # GQA: 重复 K 和 V 的头，使其数量与 Q 的头匹配
+        if self.num_kv_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_kv_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_kv_groups, dim=1)
+
         # Get indices and mask from cache.
         # 从缓存中获取索引和掩码。
         attention_indices, attention_mask = self._get_prepared_indices_and_mask(q_seq_len, kv_seq_len)
         
         if cache_position is not None:
-            # Slice for decoding.
-            # 为解码进行切片。
-            current_indices = torch.gather(attention_indices, 1, cache_position.view(1, -1, 1).expand(-1, -1, attention_indices.shape[-1]))
-            current_mask = torch.gather(attention_mask, 1, cache_position.view(1, -1, 1).expand(-1, -1, attention_mask.shape[-1]))
+            # For decoding, we only need the indices and mask for the current position.
+            # 对于解码，我们只需要当前位置的索引和掩码。
+            # For decoding, we only need the indices and mask for the current position.
+            # The slicing here is correct because cache_position corresponds to the q_seq_len dimension.
+            attention_indices = attention_indices[:, cache_position, :]
+            attention_mask = attention_mask[:, cache_position, :]
         else:
-            current_indices = attention_indices
-            current_mask = attention_mask
+            attention_indices = attention_indices[:, :q_seq_len]
+            attention_mask = attention_mask[:, :q_seq_len]
+        current_indices = attention_indices
+        current_mask = attention_mask
 
         # Expand indices to gather along the head_dim dimension.
         # 扩展索引以便沿 head_dim 维度进行收集。
@@ -625,8 +680,12 @@ class ElasticSparseAttention(nn.Module):
         return attn_out, attn_weights
 
     def _dense_forward(self, query_states, key_states, value_states, cache_position):
-        """Forward pass using the 'dense' implementation with PyTorch's SDPA."""
-        """使用 'dense' 实现和 PyTorch 的 SDPA 进行前向传播。"""
+        """
+        Forward pass using the 'dense' implementation with PyTorch's SDPA.
+        No change is needed for GQA as F.scaled_dot_product_attention handles it automatically.
+        使用 'dense' 实现和 PyTorch 的 SDPA 进行前向传播。
+        GQA 无需修改，因为 F.scaled_dot_product_attention 会自动处理。
+        """
         q_seq_len = query_states.shape[2]
         kv_seq_len = key_states.shape[2]
 
@@ -641,9 +700,9 @@ class ElasticSparseAttention(nn.Module):
             )
         
         # Slice the required portion of the pre-computed mask.
-        # Mask shape is [1, num_heads, max_seq_len, max_seq_len].
+        # Mask shape is [1, num_attention_heads, max_seq_len, max_seq_len].
         # 从预计算的掩码中切片出需要的部分。
-        # 掩码形状为 [1, num_heads, max_seq_len, max_seq_len]。
+        # 掩码形状为 [1, num_attention_heads, max_seq_len, max_seq_len]。
         attention_mask = self.full_attention_mask[:, :, :q_seq_len, :kv_seq_len]
         
         if cache_position is not None:
@@ -660,6 +719,7 @@ class ElasticSparseAttention(nn.Module):
             scale=self.scaling,
             attn_mask=attention_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
+            enable_gqa=True,
         )
         # SDPA does not return attention weights by default when a mask is provided.
         # 当提供掩码时，SDPA 默认不返回注意力权重。
@@ -678,8 +738,8 @@ class ElasticSparseAttention(nn.Module):
 
         Args:
             query_states (`torch.Tensor`): Query tensor of shape (bsz, num_heads, q_len, head_dim). // 查询张量，形状为 (bsz, num_heads, q_len, head_dim)。
-            key_states (`torch.Tensor`): Key tensor of shape (bsz, num_heads, kv_len, head_dim). // 键张量，形状为 (bsz, num_heads, kv_len, head_dim)。
-            value_states (`torch.Tensor`): Value tensor of shape (bsz, num_heads, kv_len, head_dim). // 值张量，形状为 (bsz, num_heads, kv_len, head_dim)。
+            key_states (`torch.Tensor`): Key tensor of shape (bsz, num_kv_heads, kv_len, head_dim). // 键张量，形状为 (bsz, num_kv_heads, kv_len, head_dim)。
+            value_states (`torch.Tensor`): Value tensor of shape (bsz, num_kv_heads, kv_len, head_dim). // 值张量，形状为 (bsz, num_kv_heads, kv_len, head_dim)。
             cache_position (`Optional[torch.LongTensor]`): The positions of the query tokens, used for decoding. // 查询 token 的位置，用于解码。
 
         Returns:
@@ -698,8 +758,8 @@ class ElasticSparseAttention(nn.Module):
         
         # Reshape the output back to (bsz, q_len, hidden_dim) to match standard transformer block outputs.
         # 将输出 reshape 回 (bsz, q_len, hidden_dim) 以匹配标准 Transformer 块的输出。
-        batch_size, num_heads, q_len, head_dim = query_states.shape
-        hidden_dim = num_heads * head_dim
+        batch_size, _, q_len, head_dim = query_states.shape
+        hidden_dim = self.num_attention_heads * head_dim
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, q_len, hidden_dim)
 
         return attn_output, attn_weights
